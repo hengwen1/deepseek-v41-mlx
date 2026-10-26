@@ -20,6 +20,12 @@ quantized like the rest (its routed experts are fp4 too) and carried by the
 build as declared passthrough; pass --no-mtp to drop it (earlier builds did).
 
     python scripts/convert_cli.py --src <src> --dst <out> --bits 8 --no-mtp
+
+--omlx-compat targets omlx's deepseek_v41 source reader: mxfp4 weights are
+stored byte-packed (U8 + F8_E8M0 scales — the same words, which omlx's native
+fp4 branch consumes losslessly) and mxfp8 modules become affine 8-bit (no
+mxfp8 source path there). Existing mxfp4-only builds can be converted without
+re-quantizing via scripts/omlx_compat.py.
 """
 
 import argparse
@@ -45,6 +51,9 @@ def main():
     p.add_argument("--group-size", type=int, default=64)
     p.add_argument("--no-mtp", action="store_true",
                    help="drop the MTP draft stack tensors (mtp.*)")
+    p.add_argument("--omlx-compat", action="store_true",
+                   help="store mxfp4 byte-packed (U8 + F8_E8M0) for omlx's "
+                        "deepseek_v41 reader; mxfp8 modules become affine 8-bit")
     p.add_argument("--resume", action="store_true",
                    help="skip groups whose output shard + manifest already exist")
     a = p.parse_args()
@@ -55,11 +64,13 @@ def main():
             parts.append(f"other {fmt_bits(quant_params(a.bits, a.group_size))}")
         if a.engram_bits is not None:
             parts.append(f"engram {fmt_bits(quant_params(a.engram_bits, a.group_size))}")
-        print(f"recipe: {', '.join(parts)}; mtp {'dropped' if a.no_mtp else 'kept'}", flush=True)
+        print(f"recipe: {', '.join(parts)}; mtp {'dropped' if a.no_mtp else 'kept'}"
+              + ("; omlx-compat" if a.omlx_compat else ""), flush=True)
     t0 = time.time()
     acct = convert(a.src, a.dst, bits=a.bits, expert_bits=a.expert_bits,
                    engram_bits=a.engram_bits, group_size=a.group_size,
-                   keep_mtp=not a.no_mtp, resume=a.resume)
+                   keep_mtp=not a.no_mtp, omlx_compat=a.omlx_compat,
+                   resume=a.resume)
     print(f"done in {time.time() - t0:.0f}s: {acct}")
 
 

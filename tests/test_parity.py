@@ -33,8 +33,10 @@ indexer genuinely selects (index_topk 4 < nb up to 28).
 
 import json
 import os
+import re
 import sys
 import types
+import importlib.util
 
 import numpy as np
 import torch
@@ -577,6 +579,7 @@ def release_roundtrip():
                                      group_size=32)),
                     ("mxfp", dict(bits=parse_bits("mxfp8"),
                                   expert_bits=parse_bits("mxfp4"))),
+                    ("omlx4", dict(bits=parse_bits("mxfp4"), omlx_compat=True)),
                     ("nomtp", dict(keep_mtp=False))):
         dst = os.path.join(root, f"dst_{tag}")
         acct = accts[tag] = convert(src, dst, **kw)
@@ -619,6 +622,33 @@ def release_roundtrip():
             assert "layers.0.attn.wq_b.scales" in im and "layers.0.attn.wq_b.biases" not in im
             assert "mtp.0.attn.wq_a.weight" in im
             assert "mtp.0.ffn.experts.gate_proj.weight" in im
+        if tag == "omlx4":
+            q = cfg["quantization"]
+            assert "mode" not in q, q   # root mode would poison omlx's affine specs
+            assert q["modules"]["layers.0.attn.wq_b"] == \
+                {"group_size": 32, "bits": 4, "mode": "mxfp4"}, q
+            im = json.load(open(os.path.join(dst, "model.safetensors.index.json")))["weight_map"]
+            # experts stay individual (release-style names) for omlx's reader
+            assert "layers.0.ffn.experts.0.w1.weight" in im, im
+            shard = im["layers.0.attn.wq_b.weight"]
+            tw = mx.load(os.path.join(dst, shard))["layers.0.attn.wq_b.weight"]
+            assert tw.dtype == mx.uint8 and tw.shape[-1] % 4 == 0, tw
+            # byte-packed storage must dequantize identically to mx-native words
+            w = mx.load(os.path.join(dst, shard))
+            d = mx.dequantize(w["layers.0.attn.wq_b.weight"].view(mx.uint32),
+                              w["layers.0.attn.wq_b.scales"],
+                              group_size=32, bits=4, mode="mxfp4")
+            assert mx.isfinite(d).all().item()
+        if tag == "omlx4" and importlib.util.find_spec("omlx"):
+            # cross-check: omlx's source reader must digest the build end to end
+            from omlx.patches.deepseek_v41.convert import convert as omlx_convert
+            omlx_dst = os.path.join(root, "dst_omlx_converted")
+            omlx_convert(dst, omlx_dst, preserve_mtp=True)
+            ocfg = json.load(open(os.path.join(omlx_dst, "config.json")))
+            specs = ocfg["omlx_deepseek_v41"]["quantized_modules"]
+            assert specs and all(s["mode"] == "mxfp4" for s in specs.values()), \
+                list(specs.items())[:2]
+            shutil.rmtree(omlx_dst)
         print(f"  release round-trip [{tag}]: strict load ok, "
               f"{acct['kept']} tensors kept, "
               f"{acct['mtp_kept'] if keep else acct['dropped_mtp']} mtp "
@@ -634,6 +664,40 @@ def release_roundtrip():
     assert acct2 == accts["q8_4"], (acct2, accts["q8_4"])
     print(f"  convert --resume over a finished build: all groups skipped "
           f"({_time.time() - t0:.2f}s)")
+
+    # the omlx shim: header-only retag+split of a stored mxfp4 build must yield
+    # the same tensors as --omlx-compat conversion of the same source
+    from deepseek_v41_mlx.omlx_compat import shim_build
+    dst_mxfp4 = os.path.join(root, "dst_plain_mxfp4")
+    convert(src, dst_mxfp4, bits=parse_bits("mxfp4"), keep_mtp=False)
+    shimmed = os.path.join(root, "dst_shimmed")
+    shutil.copytree(dst_mxfp4, shimmed)
+    shim_build(shimmed)
+
+    def stacked(shard_path, view_bytes=False):
+        out, parts = {}, {}
+        for k, v in mx.load(shard_path).items():
+            if view_bytes and v.dtype == mx.uint8 and k.endswith(".weight"):
+                v = v.view(mx.uint32)
+            m = re.match(r"((?:layers\.\d+)\.ffn\.experts)\.(\d+)\.(w[123])\.(weight|scales)$", k)
+            if m:
+                parts.setdefault((m.group(1), m.group(3), m.group(4)), {})[int(m.group(2))] = v
+                continue
+            out[k] = v
+        for (base, wn, suf), ps in parts.items():
+            proj = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}[wn]
+            out[f"{base}.{proj}.{suf}"] = mx.stack([ps[i] for i in sorted(ps)])
+        return out
+
+    shim_c = stacked(os.path.join(shimmed, "model-layers-00.safetensors"), view_bytes=True)
+    compat_c = stacked(os.path.join(root, "dst_omlx4", "model-layers-00.safetensors"),
+                       view_bytes=True)
+    assert set(shim_c) == set(compat_c), (set(shim_c) ^ set(compat_c))
+    for k in shim_c:
+        assert str(shim_c[k].dtype) == str(compat_c[k].dtype) and \
+            mx.array_equal(shim_c[k], compat_c[k]).item(), k
+    model_s, _ = load(shimmed)
+    print("  omlx shim: header-retagged build == --omlx-compat build, strict load ok")
 
     # strictness negative control: remove one tensor -> load must raise
     dst = os.path.join(root, "dst_bf16")

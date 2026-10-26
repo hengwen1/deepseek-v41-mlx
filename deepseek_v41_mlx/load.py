@@ -28,6 +28,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -152,9 +153,11 @@ def load(path: str, lazy: bool | None = None, strict: bool = True):
                         eb["group_size"], eb["bits"], mode=eb.get("mode", "affine"))
 
     loaded, vision_skipped, mtp_skipped = set(), set(), set()
+    quant_entries = q.get("modules") if q else None
     for shard in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
         w = mx.load(shard)
         items = []
+        expert_parts: dict = {}
         for k, v in w.items():
             if k.startswith(VISION_PREFIXES):
                 vision_skipped.add(k)      # declared passthrough, text-only runtime
@@ -162,7 +165,30 @@ def load(path: str, lazy: bool | None = None, strict: bool = True):
             if k.startswith("mtp."):
                 mtp_skipped.add(k)         # declared passthrough, draft stack
                 continue
+            if k.endswith(".weight") and v.dtype == mx.uint8 and quant_entries:
+                base = k[:-len(".weight")]
+                m = re.match(r"((?:layers\.\d+)\.ffn\.experts)\.\d+\.(w[123])$", base)
+                if m:
+                    proj = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}[m.group(2)]
+                    base = f"{m.group(1)}.{proj}"   # module map keys the stacked runtime module
+                entry = quant_entries.get(base)
+                if isinstance(entry, dict) and entry.get("mode", "affine") != "affine":
+                    # omlx-compat mxfp4 storage: the packed nibbles as bytes
+                    v = v.view(mx.uint32)
+            m = re.match(r"((?:layers\.\d+)\.ffn\.experts)\.(\d+)\.(w[123])\.(weight|scales|biases)$", k)
+            if m:
+                # omlx-compat builds keep experts individual (release-style
+                # names); re-stack them into the runtime's SwitchGLU layout
+                base, idx, wn, suf = m.groups()
+                expert_parts.setdefault((base, wn, suf), {})[int(idx)] = v
+                continue
             items.append((k, v))
+        for (base, wn, suf), parts in expert_parts.items():
+            proj = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}[wn]
+            idxs = sorted(parts)
+            assert idxs == list(range(len(idxs))), f"incomplete experts for {base}.{wn}.{suf}"
+            items.append((f"{base}.{proj}.{suf}",
+                          mx.stack([parts[i] for i in idxs])))
         model.load_weights(items, strict=False)
         if not lazy:
             mx.eval([v for _, v in items])

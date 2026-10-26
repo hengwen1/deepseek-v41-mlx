@@ -140,13 +140,18 @@ def _to_u8(a: mx.array) -> mx.array:
 
 
 def sanitize_group(names: list[str], tensors: dict[str, mx.array],
-                   dtype=mx.bfloat16) -> dict[str, mx.array]:
+                   dtype=mx.bfloat16, stack_experts: bool = True) -> dict[str, mx.array]:
     """Sanitize one coherent group of raw tensors (a layer, the MTP stack, or
     the top level).
 
     Returns final-name -> array. ``mtp.*`` sanitizes exactly like a backbone
     layer (retention is the caller's choice); the tied ``mtp.N.embed`` /
     ``mtp.N.head`` clones are dropped; vision tensors pass through unchanged.
+
+    With ``stack_experts=False`` (omlx compat) routed experts keep their
+    release-style individual names — ``...ffn.experts.{i}.{w1,w3,w2}.weight`` —
+    which omlx's source reader requires (it stacks them itself); the caller's
+    loader re-stacks them into the runtime's SwitchGLU layout.
     """
     out: dict[str, mx.array] = {}
     consumed = set()
@@ -188,7 +193,7 @@ def sanitize_group(names: list[str], tensors: dict[str, mx.array],
             w = t
 
         m = re.match(r"((?:layers\.\d+|mtp\.\d+)\.ffn\.experts)\.(\d+)\.(w[123])\.weight$", name)
-        if m:
+        if m and stack_experts:
             prefix, idx, wn = m.group(1), int(m.group(2)), m.group(3)
             proj = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}[wn]
             expert_parts.setdefault(f"{prefix}.{proj}.weight", {})[idx] = w
@@ -213,12 +218,18 @@ def sanitize_group(names: list[str], tensors: dict[str, mx.array],
 
 
 def quantize_tree(weights: dict[str, mx.array], bits, expert_bits,
-                  group_size: int = 64) -> tuple[dict[str, mx.array], dict[str, dict]]:
+                  group_size: int = 64, omlx_compat: bool = False) -> tuple[dict[str, mx.array], dict[str, dict]]:
     """Replace eligible ``.weight`` tensors with MLX quantized tuples, matching
     what ``nn.quantize`` produces at load time: affine (weight, scales, biases)
     triples, or (weight, scales) pairs for mxfp4/mxfp8 modules — no bias term,
     group size pinned to 32. ``bits``/``expert_bits`` take an affine width or a
     ``{"bits", "mode"}`` microscaling spec.
+
+    With ``omlx_compat`` (omlx's deepseek_v41 source reader): mxfp4 weights are
+    stored byte-packed — the same words viewed as uint8, retagged U8 + F8_E8M0
+    scales at save time, which omlx's native fp4 branch consumes losslessly;
+    mxfp8 has no lossless source path there (per-row e8m0 scales vs the official
+    32-row-block layout), so those modules fall back to affine 8-bit.
 
     Also returns the per-module map {module path: {group_size, bits[, mode]}}
     that config.json carries for the loader to replay."""
@@ -232,16 +243,30 @@ def quantize_tree(weights: dict[str, mx.array], bits, expert_bits,
         if p is None or not is_quant_target(name, w.shape[-1], p["group_size"]):
             out[name] = w
             continue
-        q = mx.quantize(w, group_size=p["group_size"], bits=p["bits"],
-                        mode=p.get("mode", "affine"))
+        mode = p.get("mode", "affine")
+        if omlx_compat and mode == "mxfp8":
+            g = group_size if w.shape[-1] % group_size == 0 else p["group_size"]
+            p = {"group_size": g, "bits": 8}
+            mode = "affine"
+        q = mx.quantize(w, group_size=p["group_size"], bits=p["bits"], mode=mode)
+        weight = q[0]
+        if omlx_compat and mode == "mxfp4":
+            weight = weight.view(mx.uint8)   # byte-packed nibbles; identical words
         base = name[:-len(".weight")]
-        out[f"{base}.weight"] = q[0]
+        out[f"{base}.weight"] = weight
         out[f"{base}.scales"] = q[1]
         if len(q) == 3:
             out[f"{base}.biases"] = q[2]
         entry = {"group_size": p["group_size"], "bits": p["bits"]}
-        if "mode" in p:
-            entry["mode"] = p["mode"]
+        if mode != "affine":
+            entry["mode"] = mode
+        if omlx_compat:
+            # individual experts share the family spec of their stacked runtime module
+            m = re.match(r"((?:layers\.\d+|mtp\.\d+)\.ffn\.experts)\.\d+\.(w[123])$", base)
+            if m:
+                proj = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}[m.group(2)]
+                modules.setdefault(f"{m.group(1)}.{proj}", dict(entry))
+                continue
         modules[base] = entry
     return out, modules
 
@@ -365,7 +390,7 @@ def _read_st_header(path: str) -> dict:
 def convert(src: str, dst: str, bits: int | dict | None = None,
             expert_bits: int | dict | None = None, engram_bits: int | dict | None = None,
             group_size: int = 64, dtype=mx.bfloat16, resume: bool = False,
-            keep_mtp: bool = True) -> dict:
+            keep_mtp: bool = True, omlx_compat: bool = False) -> dict:
     """Stream the release group by group (top level, each layer, MTP, vision)
     into an MLX build at ``dst`` — one output shard per group, written to a
     temp name and renamed on completion, so ``resume=True`` skips every
@@ -382,6 +407,11 @@ def convert(src: str, dst: str, bits: int | dict | None = None,
     the default retains it — sanitized and quantized with the rest, written
     to its own ``model-mtp`` shard, carried as declared passthrough by the
     loader.
+
+    ``omlx_compat`` stores mxfp4 weights byte-packed (U8 + F8_E8M0 scales,
+    consumed losslessly by omlx's native fp4 branch) and downgrades mxfp8
+    modules to affine 8-bit (omlx's source reader has no mxfp8 path); the
+    root quantization block carries no ``mode`` omlx could mis-merge.
 
     ``config.json`` gets a ``quantization`` block with defaults plus an
     explicit per-module map keyed by runtime-internal module paths.
@@ -431,6 +461,12 @@ def convert(src: str, dst: str, bits: int | dict | None = None,
     index: dict[str, str] = {}
     module_map: dict[str, dict] = {}
     t0 = time.time()
+    engram_eff = engram_bits
+    if omlx_compat and isinstance(engram_bits, dict) and engram_bits.get("mode", "affine") != "affine":
+        engram_eff = {"bits": engram_bits["bits"], "mode": "affine"}
+        print(f"[omlx-compat] engram tables: mxfp{engram_bits['bits']} -> affine "
+              f"{engram_bits['bits']}b (no mxfp engram path in omlx's source reader)",
+              flush=True)
 
     for gi, g in enumerate(order, 1):
         tag = _group_tag(g)
@@ -450,24 +486,43 @@ def convert(src: str, dst: str, bits: int | dict | None = None,
             print(f"[{gi}/{len(order)}] {g}: {len(names)} tensors — "
                   f"sanitizing + quantizing...", flush=True)
             work = [n for n in names if n not in engram_pair]
-            sane = sanitize_group(work, fetch(work), dtype)
+            sane = sanitize_group(work, fetch(work), dtype,
+                                  stack_experts=not omlx_compat)
             grp_modules: dict[str, dict] = {}
             if bits and g != "vision":
-                sane, grp_modules = quantize_tree(sane, bits, expert_bits, group_size)
+                sane, grp_modules = quantize_tree(sane, bits, expert_bits, group_size,
+                                                  omlx_compat=omlx_compat)
             for v in sane.values():
                 mx.eval(v)
             tmp = out_files["main"] + ".tmp.safetensors"
             mx.save_safetensors(tmp, sane)
             os.replace(tmp, out_files["main"])
+            if omlx_compat and grp_modules:
+                from .omlx_compat import mxfp4_dtypes, retag_shard
+                dtypes = mxfp4_dtypes(grp_modules)
+                if dtypes:
+                    # expand stacked expert entries to the individual names
+                    expanded = {}
+                    for key, dt in dtypes.items():
+                        m = re.match(r"((?:layers\.\d+|mtp\.\d+)\.ffn\.experts)\."
+                                     r"(gate_proj|up_proj|down_proj)\.(weight|scales)$", key)
+                        if m:
+                            wn = {"gate_proj": "w1", "up_proj": "w3",
+                                  "down_proj": "w2"}[m.group(2)]
+                            pat = re.compile(rf"{re.escape(m.group(1))}\.\d+\.{wn}\.{m.group(3)}$")
+                            expanded.update({k: dt for k in sane if pat.match(k)})
+                        else:
+                            expanded[key] = dt
+                    retag_shard(out_files["main"], expanded)
             engram_names = []
             if engram_pair and engram_bits:
                 print(f"  engram table -> re-quantizing "
-                      f"({fmt_bits(_family(engram_bits, group_size))}) in row chunks...",
+                      f"({fmt_bits(_family(engram_eff, group_size))}) in row chunks...",
                       flush=True)
                 wname = next(n for n in engram_pair if n.endswith(".weight"))
                 base = wname[: -len(".weight")]
                 triple = quantize_engram_table_from_file(src, wmap, wname,
-                                                         engram_bits, group_size)
+                                                         engram_eff, group_size)
                 shard = {f"{base}.{suf}": v for suf, v in triple.items()}
                 tmp = out_files["engram"] + ".tmp.safetensors"
                 mx.save_safetensors(tmp, shard)
@@ -506,6 +561,28 @@ def convert(src: str, dst: str, bits: int | dict | None = None,
     print(f"done: {len(index)} tensors in {len(set(index.values()))} shards, "
           f"{total_gb / 1e9:.1f} GB — {time.time() - t0:.0f}s total", flush=True)
 
+    if omlx_compat and engram_bits:
+        # omlx resolves quantized engram tables through the module map too
+        for k in index:
+            if k.endswith(".engram.embed.scales"):
+                module_map.setdefault(k[:-len(".scales")],
+                                      {"group_size": group_size,
+                                       "bits": _family(engram_eff, group_size)["bits"]})
+    if omlx_compat:
+        # individual affine experts need their own spec entries for omlx's reader
+        # (mxfp4 experts ride the dtype-tagged native branch and need none)
+        root_fam = _family(bits, group_size) or {}
+        for key, entry in list(module_map.items()):
+            m = re.match(r"((?:layers\.\d+)\.ffn\.experts)\.(gate_proj|up_proj|down_proj)$", key)
+            if not m or entry.get("mode", "affine") != "affine" or entry == root_fam:
+                continue
+            wn = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}[m.group(2)]
+            pat = re.compile(rf"{re.escape(m.group(1))}\.(\d+)\.{wn}\.weight$")
+            for k in index:
+                mm = pat.match(k)
+                if mm:
+                    module_map.setdefault(f"{m.group(1)}.{mm.group(1)}.{wn}", dict(entry))
+
     json.dump({"metadata": {}, "weight_map": index},
               open(os.path.join(dst, "model.safetensors.index.json"), "w"))
 
@@ -519,9 +596,17 @@ def convert(src: str, dst: str, bits: int | dict | None = None,
         if "text_config" in out_cfg:
             out_cfg["text_config"]["num_nextn_predict_layers"] = 0
     if bits or engram_bits:
-        q = dict(_family(bits, group_size) or {"group_size": group_size})
+        if omlx_compat:
+            # no root "mode" (omlx merges root defaults into every affine spec)
+            # and flat per-module entries (omlx reads mlx_lm-style overrides)
+            root_bits = bits["bits"] if isinstance(bits, dict) else bits
+            q = {"group_size": group_size, "bits": root_bits}
+            for path, entry in module_map.items():
+                q[path] = dict(entry)
+        else:
+            q = dict(_family(bits, group_size) or {"group_size": group_size})
         q["expert_bits"] = _family(expert_bits, group_size)
-        q["engram_bits"] = _family(engram_bits, group_size)
+        q["engram_bits"] = _family(engram_eff, group_size)
         q["modules"] = module_map
         out_cfg["quantization"] = q
         out_cfg["quantization_config"] = q
