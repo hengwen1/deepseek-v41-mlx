@@ -469,7 +469,8 @@ def _write_tiny_release(src: str, rng):
             f32(p + "engram.q_weight", 4, D, scale=1.0)
             f32(p + "engram.k_weight", 4, D, scale=1.0)
 
-    # mtp stack (must be dropped) and vision tower (must pass through)
+    # mtp draft stack (kept by default; keep_mtp=False drops it) and vision
+    # tower (always passes through)
     fp8("mtp.0.attn.wq_a", QLR, D)
     fp4("mtp.0.ffn.experts.0.w1", INTER, D)
     f32("mtp.0.hc_attn_base", 24)
@@ -551,7 +552,7 @@ def release_roundtrip():
     import shutil
     import tempfile
 
-    from deepseek_v41_mlx.convert import convert
+    from deepseek_v41_mlx.convert import convert, parse_bits
     from deepseek_v41_mlx.load import load
 
     rng = np.random.default_rng(19)
@@ -559,22 +560,45 @@ def release_roundtrip():
     src = os.path.join(root, "src")
     index = _write_tiny_release(src, rng)
 
-    n_mtp = sum(1 for k in index if k.startswith("mtp."))
+    n_mtp = sum(1 for k in index if k.startswith("mtp.") and not k.endswith(".scale"))
+    n_mtp_raw = sum(1 for k in index if k.startswith("mtp."))
     n_vis = sum(1 for k in index if k.startswith(("vision.", "aligner.", "image_")))
     assert n_mtp and n_vis
+
+    # microscaling specs parse (mxf4/mxf8 aliases accepted)
+    assert parse_bits("mxfp4") == {"bits": 4, "mode": "mxfp4"}
+    assert parse_bits("MXF8") == {"bits": 8, "mode": "mxfp8"}
+    assert parse_bits("4") == {"bits": 4, "mode": "affine"}
 
     accts = {}
     for tag, kw in (("bf16", {}),
                     ("q8_4", dict(bits=8, expert_bits=4, group_size=32)),
                     ("q8_4_e4", dict(bits=8, expert_bits=4, engram_bits=4,
-                                     group_size=32))):
+                                     group_size=32)),
+                    ("mxfp", dict(bits=parse_bits("mxfp8"),
+                                  expert_bits=parse_bits("mxfp4"))),
+                    ("nomtp", dict(keep_mtp=False))):
         dst = os.path.join(root, f"dst_{tag}")
         acct = accts[tag] = convert(src, dst, **kw)
-        assert acct["dropped_mtp"] == n_mtp, acct
+        keep = tag != "nomtp"
+        assert acct["dropped_mtp"] == (0 if keep else n_mtp_raw), acct
+        man_path = os.path.join(dst, "model-mtp.manifest.json")
+        if keep:
+            man = json.load(open(man_path))
+            n_mtp_out = sum(len(v) for v in man["files"].values())
+            assert acct["mtp_kept"] == n_mtp_out > 0, (acct, man)
+        else:
+            assert not os.path.exists(man_path)
         assert acct["vision_passthrough"] == n_vis, acct
+        assert os.path.exists(os.path.join(dst, "model-mtp.safetensors")) == keep
+        cfg = json.load(open(os.path.join(dst, "config.json")))
+        assert cfg.get("text_config", {}).get("num_nextn_predict_layers", 3) == (3 if keep else 0)
+        if not keep:
+            assert cfg["num_nextn_predict_layers"] == 0
         model, args = load(dst)
         assert args.n_layers == CFG["n_layers"] and args.norm_eps == CFG["norm_eps"]
         assert len(model._vision_passthrough) == n_vis
+        assert len(model._mtp_passthrough) == (n_mtp_out if keep else 0)
         model.set_token_map(list(range(VOCAB)))
         cache = model.make_cache(bsz=1, max_seq_len=64)
         ids = mx.array(rng.integers(3, VOCAB, size=(1, 20)))
@@ -584,8 +608,21 @@ def release_roundtrip():
         # decode continues from the loaded state
         logits2 = model(mx.array([[5]]), cache)
         assert np.isfinite(np.array(logits2)).all()
+        if tag == "mxfp":
+            q = cfg["quantization"]
+            assert q["group_size"] == 32 and q["mode"] == "mxfp8", q
+            assert q["modules"]["layers.0.attn.wq_b"] == \
+                {"group_size": 32, "bits": 8, "mode": "mxfp8"}, q
+            assert q["modules"]["layers.0.ffn.experts.gate_proj"] == \
+                {"group_size": 32, "bits": 4, "mode": "mxfp4"}, q
+            im = json.load(open(os.path.join(dst, "model.safetensors.index.json")))["weight_map"]
+            assert "layers.0.attn.wq_b.scales" in im and "layers.0.attn.wq_b.biases" not in im
+            assert "mtp.0.attn.wq_a.weight" in im
+            assert "mtp.0.ffn.experts.gate_proj.weight" in im
         print(f"  release round-trip [{tag}]: strict load ok, "
-              f"{acct['kept']} tensors kept, {n_mtp} mtp dropped, "
+              f"{acct['kept']} tensors kept, "
+              f"{acct['mtp_kept'] if keep else acct['dropped_mtp']} mtp "
+              f"{'kept' if keep else 'dropped'}, "
               f"{n_vis} vision passthrough, forward+decode finite")
 
     # resume: a second convert over a finished build must skip every group

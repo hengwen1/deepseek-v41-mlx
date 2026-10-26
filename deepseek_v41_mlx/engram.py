@@ -204,22 +204,26 @@ class EngramEmbedding(nn.Module):
 
 
 class QuantizedEngramEmbedding(nn.Module):
-    """The hash table in MLX affine quantization (weight/scales/biases), rows
-    dequantized on lookup. Used when the build was converted with
-    ``engram_bits`` — the native fp8 table alone is 203 GB, which does not
-    leave room for the rest of the model on a 512 GB machine."""
+    """The hash table in MLX quantization (affine: weight/scales/biases;
+    mxfp4/mxfp8: weight/scales, group size pinned to 32), rows dequantized on
+    lookup. Used when the build was converted with ``engram_bits`` — the
+    native fp8 table alone is 203 GB, which does not leave room for the rest
+    of the model on a 512 GB machine."""
 
-    def __init__(self, num_embeddings: int, dim: int, group_size: int = 64, bits: int = 4):
+    def __init__(self, num_embeddings: int, dim: int, group_size: int = 64,
+                 bits: int = 4, mode: str = "affine"):
         super().__init__()
-        self.group_size, self.bits = group_size, bits
+        self.group_size, self.bits, self.mode = group_size, bits, mode
         self.weight = mx.zeros((num_embeddings, dim * bits // 32), dtype=mx.uint32)
-        self.scales = mx.zeros((num_embeddings, dim // group_size), dtype=mx.bfloat16)
-        self.biases = mx.zeros((num_embeddings, dim // group_size), dtype=mx.bfloat16)
+        self.scales = mx.zeros((num_embeddings, dim // group_size),
+                               dtype=mx.bfloat16 if mode == "affine" else mx.uint8)
+        if mode == "affine":
+            self.biases = mx.zeros((num_embeddings, dim // group_size), dtype=mx.bfloat16)
 
     def __call__(self, indices: mx.array) -> mx.array:
         out = mx.dequantize(self.weight[indices], scales=self.scales[indices],
-                            biases=self.biases[indices],
-                            group_size=self.group_size, bits=self.bits)
+                            biases=self.biases[indices] if self.mode == "affine" else None,
+                            group_size=self.group_size, bits=self.bits, mode=self.mode)
         return out.astype(mx.float32)
 
 

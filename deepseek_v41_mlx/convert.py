@@ -12,16 +12,23 @@ stacking:
   parameters to bf16 would double 40% of the model); both tensors pass through
   as uint8;
 * ``hc_*``, ``attn_sink``, ``gate.bias``, ``gate.bias_vl`` -> fp32;
-* ``mtp.*`` (the DSpark/MTP draft stack) is dropped — it hangs off the
-  reference's separate ``forward_spec`` path;
+* ``mtp.*`` (the DSpark/MTP draft stack) is kept by default — sanitized and
+  quantized like the backbone (its routed experts are fp4 too) and written to
+  its own ``model-mtp`` shard; the tied ``mtp.N.embed``/``mtp.N.head`` clones
+  are dropped (the reference ties them to the backbone's tensors). The
+  text-only runtime carries the retained tensors as declared passthrough.
+  ``keep_mtp=False`` drops the stack (earlier builds did);
 * the vision tower (``vision.*``, ``aligner.*``, ``image_start/end/newline``)
   is carried through **unchanged** under its original names. The text-only
   runtime does not load it, but the tensors stay in the build (they are bf16
   and small, ~0.8 GB) so nothing silently vanishes; ``load.py`` accounts for
   them explicitly.
 
-Quantization (optional): MLX affine quantization applied per module, experts at
-``expert_bits`` and everything else at ``bits``. ``wo_a`` is NEVER quantized:
+Quantization (optional): applied per module, experts at ``expert_bits`` and
+everything else at ``bits`` — each an affine bit width (2-8) or a microscaling
+format, ``{"bits": 4, "mode": "mxfp4"}`` as :func:`parse_bits` returns:
+E2M1/E4M3 elements sharing one e8m0 scale per group of 32 and no bias term, so
+the group size is pinned to 32 for those modules. ``wo_a`` is NEVER quantized:
 attention reshapes its weight to ``[o_groups, o_lora_rank, -1]`` and a
 quantized Linear's ``.weight`` is packed uint32 — the reshape would carve
 packed bytes, not logical weights. The same predicate is replayed at load time.
@@ -29,10 +36,12 @@ packed bytes, not logical weights. The same predicate is replayed at load time.
 
 from __future__ import annotations
 
+import argparse
 import glob
 import json
 import os
 import re
+import time
 
 import mlx.core as mx
 
@@ -40,6 +49,45 @@ from .config import ModelArgs
 from .dequant import dequant_fp4, dequant_fp8, is_fp4_expert
 
 VISION_PREFIXES = ("vision.", "aligner.", "image_start", "image_end", "image_newline")
+
+_MXFP_RE = re.compile(r"^mx(?:f(?:p)?)?([48])$")
+
+
+def parse_bits(value) -> dict:
+    """A --bits value -> {"bits", "mode"}: affine widths (2-8) or mxfp4/mxfp8
+    (mxf4/mxf8 accepted)."""
+    text = str(value).strip().lower()
+    if m := _MXFP_RE.match(text):
+        return {"bits": int(m.group(1)), "mode": "mxfp" + m.group(1)}
+    try:
+        return {"bits": int(text), "mode": "affine"}
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid bits {value!r}: use 2-8, mxfp4 or mxfp8") from None
+
+
+def quant_params(mode_bits: dict, group_size: int) -> dict:
+    """Complete per-module params; the mx spec requires (and this pins) a group
+    size of 32 for the microscaling modes."""
+    mode = mode_bits["mode"]
+    out = {"group_size": 32 if mode != "affine" else group_size, "bits": mode_bits["bits"]}
+    if mode != "affine":
+        out["mode"] = mode
+    return out
+
+
+def fmt_bits(params: dict) -> str:
+    mode = params.get("mode", "affine")
+    return mode if mode != "affine" else f"{params['bits']}b"
+
+
+def _family(value, group_size: int) -> dict | None:
+    """int | {"bits", "mode"} | None -> complete params dict | None."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return quant_params(value, group_size)
+    return quant_params({"bits": int(value), "mode": "affine"}, group_size)
 
 # modules kept at bf16 even when quantizing (beyond shape-ineligible ones):
 #   wo_a          — block-diagonal reshape carves packed bytes (see module doc)
@@ -63,10 +111,13 @@ def is_quant_target(name: str, in_dim: int, group_size: int) -> bool:
     return len(tail) >= 2 and tail[-2] in quantizable
 
 
-def bits_for(name: str, bits: int, expert_bits: int | None) -> int:
-    if expert_bits and is_fp4_expert(name):
-        return expert_bits
-    return bits
+def bits_for(name: str, bits, expert_bits=None, group_size: int = 64) -> dict | None:
+    """Complete params for one module: routed experts at ``expert_bits`` when
+    given, everything else at ``bits``. Either argument takes an affine width
+    or a ``{"bits", "mode"}`` microscaling spec; ``None`` means no quantization."""
+    if expert_bits is not None and is_fp4_expert(name):
+        return _family(expert_bits, group_size)
+    return _family(bits, group_size)
 
 
 def _shard_iter(src: str):
@@ -90,10 +141,12 @@ def _to_u8(a: mx.array) -> mx.array:
 
 def sanitize_group(names: list[str], tensors: dict[str, mx.array],
                    dtype=mx.bfloat16) -> dict[str, mx.array]:
-    """Sanitize one coherent group of raw tensors (a layer, or the top level).
+    """Sanitize one coherent group of raw tensors (a layer, the MTP stack, or
+    the top level).
 
-    Returns final-name -> array. ``mtp.*`` must be filtered by the caller;
-    vision tensors pass through unchanged.
+    Returns final-name -> array. ``mtp.*`` sanitizes exactly like a backbone
+    layer (retention is the caller's choice); the tied ``mtp.N.embed`` /
+    ``mtp.N.head`` clones are dropped; vision tensors pass through unchanged.
     """
     out: dict[str, mx.array] = {}
     consumed = set()
@@ -104,6 +157,12 @@ def sanitize_group(names: list[str], tensors: dict[str, mx.array],
             continue
         if name.startswith(VISION_PREFIXES):
             out[name] = tensors[name]
+            continue
+        if re.match(r"mtp\.\d+\.(embed|head)\.weight$", name):
+            # tied to the backbone's embed/head — the reference drops the clones
+            scale_name = name[:-len(".weight")] + ".scale"
+            if scale_name in tensors:
+                consumed.add(scale_name)
             continue
         if name.endswith(".scale"):
             continue  # handled with its weight
@@ -128,7 +187,7 @@ def sanitize_group(names: list[str], tensors: dict[str, mx.array],
         else:
             w = t
 
-        m = re.match(r"(layers\.\d+\.ffn\.experts)\.(\d+)\.(w[123])\.weight$", name)
+        m = re.match(r"((?:layers\.\d+|mtp\.\d+)\.ffn\.experts)\.(\d+)\.(w[123])\.weight$", name)
         if m:
             prefix, idx, wn = m.group(1), int(m.group(2)), m.group(3)
             proj = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}[wn]
@@ -153,59 +212,79 @@ def sanitize_group(names: list[str], tensors: dict[str, mx.array],
     return out
 
 
-def quantize_tree(weights: dict[str, mx.array], bits: int, expert_bits: int | None,
-                  group_size: int) -> tuple[dict[str, mx.array], dict[str, dict]]:
-    """Replace eligible ``.weight`` tensors with MLX affine (weight, scales,
-    biases) triples, matching what ``nn.quantize`` produces at load time.
-    Also returns the per-module map {module path: {group_size, bits}} that
-    config.json carries for the loader to replay."""
+def quantize_tree(weights: dict[str, mx.array], bits, expert_bits,
+                  group_size: int = 64) -> tuple[dict[str, mx.array], dict[str, dict]]:
+    """Replace eligible ``.weight`` tensors with MLX quantized tuples, matching
+    what ``nn.quantize`` produces at load time: affine (weight, scales, biases)
+    triples, or (weight, scales) pairs for mxfp4/mxfp8 modules — no bias term,
+    group size pinned to 32. ``bits``/``expert_bits`` take an affine width or a
+    ``{"bits", "mode"}`` microscaling spec.
+
+    Also returns the per-module map {module path: {group_size, bits[, mode]}}
+    that config.json carries for the loader to replay."""
     out = {}
     modules: dict[str, dict] = {}
     for name, w in weights.items():
-        if name.startswith(VISION_PREFIXES) or not is_quant_target(name, w.shape[-1], group_size):
+        if name.startswith(VISION_PREFIXES):
             out[name] = w
             continue
-        b = bits_for(name, bits, expert_bits)
-        wq, scales, biases = mx.quantize(w, group_size=group_size, bits=b)
+        p = bits_for(name, bits, expert_bits, group_size)
+        if p is None or not is_quant_target(name, w.shape[-1], p["group_size"]):
+            out[name] = w
+            continue
+        q = mx.quantize(w, group_size=p["group_size"], bits=p["bits"],
+                        mode=p.get("mode", "affine"))
         base = name[:-len(".weight")]
-        out[f"{base}.weight"] = wq
-        out[f"{base}.scales"] = scales
-        out[f"{base}.biases"] = biases
-        modules[base] = {"group_size": group_size, "bits": b}
+        out[f"{base}.weight"] = q[0]
+        out[f"{base}.scales"] = q[1]
+        if len(q) == 3:
+            out[f"{base}.biases"] = q[2]
+        entry = {"group_size": p["group_size"], "bits": p["bits"]}
+        if "mode" in p:
+            entry["mode"] = p["mode"]
+        modules[base] = entry
     return out, modules
 
 
-def quantize_engram_table(weight_u8: mx.array, scale_u8: mx.array, bits: int,
-                          group_size: int) -> dict[str, mx.array]:
-    """Native fp8+ue8m0 table (already in memory) -> MLX affine triple, in row
-    chunks. NOTE: evaluating any chunk of a lazily-loaded mx tensor
-    materializes the WHOLE load node, so for the 98 GB release tables use
+def quantize_engram_table(weight_u8: mx.array, scale_u8: mx.array, bits,
+                          group_size: int, step: int = 1 << 22) -> dict[str, mx.array]:
+    """Native fp8+ue8m0 table (already in memory) -> MLX quantized tuple, in
+    row chunks (affine: weight/scales/biases; mxfp: weight/scales). NOTE:
+    evaluating any chunk of a lazily-loaded mx tensor materializes the WHOLE
+    load node, so for the 98 GB release tables use
     :func:`quantize_engram_table_from_file`, which slices rows from disk.
     This in-memory variant serves tests and the ladder's gathered rows."""
     from .dequant import dequant_fp8_rows
+    p = _family(bits, group_size)
+    kw = dict(group_size=p["group_size"], bits=p["bits"], mode=p.get("mode", "affine"))
     rows = weight_u8.shape[0]
-    step = 1 << 22
     cw, cs, cb = [], [], []
     for i in range(0, rows, step):
         deq = dequant_fp8_rows(weight_u8[i:i + step], scale_u8[i:i + step])
-        w, s, b = mx.quantize(deq.astype(mx.bfloat16), group_size=group_size, bits=bits)
-        mx.eval(w, s, b)
-        cw.append(w); cs.append(s); cb.append(b)
-    return {"weight": mx.concatenate(cw), "scales": mx.concatenate(cs),
-            "biases": mx.concatenate(cb)}
+        q = mx.quantize(deq.astype(mx.bfloat16), **kw)
+        mx.eval(q)
+        cw.append(q[0]); cs.append(q[1])
+        if len(q) == 3:
+            cb.append(q[2])
+    out = {"weight": mx.concatenate(cw), "scales": mx.concatenate(cs)}
+    if cb:
+        out["biases"] = mx.concatenate(cb)
+    return out
 
 
 def quantize_engram_table_from_file(src_dir: str, wmap: dict, wname: str,
-                                    bits: int, group_size: int,
+                                    bits, group_size: int,
                                     step: int = 1 << 22) -> dict[str, mx.array]:
     """Stream a release engram table off disk in row chunks (safetensors row
-    slicing — never materializes the 98 GB tensor) into an MLX affine triple.
-    Chunk arithmetic is identical to :func:`quantize_engram_table` (affine
-    quantization is row-local)."""
+    slicing — never materializes the 98 GB tensor) into an MLX quantized tuple
+    (affine: weight/scales/biases; mxfp: weight/scales). Chunk arithmetic is
+    identical to :func:`quantize_engram_table` (quantization is row-local)."""
     import torch
     from safetensors import safe_open
     from .dequant import dequant_fp8_rows
 
+    p = _family(bits, group_size)
+    kw = dict(group_size=p["group_size"], bits=p["bits"], mode=p.get("mode", "affine"))
     sname = wname[:-len(".weight")] + ".scale"
     fw = safe_open(os.path.join(src_dir, wmap[wname]), framework="pt")
     fs = fw if wmap[sname] == wmap[wname] else \
@@ -217,13 +296,17 @@ def quantize_engram_table_from_file(src_dir: str, wmap: dict, wname: str,
         w_u8 = mx.array(slw[i:i + step].view(torch.uint8).numpy())
         s_u8 = mx.array(sls[i:i + step].view(torch.uint8).numpy())
         deq = dequant_fp8_rows(w_u8, s_u8)
-        w, s, b = mx.quantize(deq.astype(mx.bfloat16), group_size=group_size, bits=bits)
-        mx.eval(w, s, b)
-        cw.append(w); cs.append(s); cb.append(b)
+        q = mx.quantize(deq.astype(mx.bfloat16), **kw)
+        mx.eval(q)
+        cw.append(q[0]); cs.append(q[1])
+        if len(q) == 3:
+            cb.append(q[2])
         del w_u8, s_u8, deq
         mx.clear_cache()
-    return {"weight": mx.concatenate(cw), "scales": mx.concatenate(cs),
-            "biases": mx.concatenate(cb)}
+    out = {"weight": mx.concatenate(cw), "scales": mx.concatenate(cs)}
+    if cb:
+        out["biases"] = mx.concatenate(cb)
+    return out
 
 
 def _group_tag(g: str) -> str:
@@ -279,21 +362,30 @@ def _read_st_header(path: str) -> dict:
         return json.loads(f.read(n))
 
 
-def convert(src: str, dst: str, bits: int | None = None,
-            expert_bits: int | None = None, engram_bits: int | None = None,
-            group_size: int = 64, dtype=mx.bfloat16, resume: bool = False) -> dict:
-    """Stream the release group by group (top level, each layer, vision) into
-    an MLX build at ``dst`` — one output shard per group, written to a temp
-    name and renamed on completion, so ``resume=True`` skips every finished
-    group at a clean layer boundary.
+def convert(src: str, dst: str, bits: int | dict | None = None,
+            expert_bits: int | dict | None = None, engram_bits: int | dict | None = None,
+            group_size: int = 64, dtype=mx.bfloat16, resume: bool = False,
+            keep_mtp: bool = True) -> dict:
+    """Stream the release group by group (top level, each layer, MTP, vision)
+    into an MLX build at ``dst`` — one output shard per group, written to a
+    temp name and renamed on completion, so ``resume=True`` skips every
+    finished group at a clean layer boundary.
+
+    ``bits``/``expert_bits``/``engram_bits`` take an affine width (2-8) or a
+    microscaling spec ``{"bits": 4, "mode": "mxfp4"}`` (see :func:`parse_bits`).
 
     ``engram_bits`` re-quantizes the two engram tables from native fp8+ue8m0
-    (203 GB total) to MLX affine, streamed in row chunks (never materialized
-    whole); ``None`` keeps them native, byte-streamed into their own shard.
+    (203 GB total), streamed in row chunks (never materialized whole);
+    ``None`` keeps them native, byte-streamed into their own shard.
+
+    ``keep_mtp=False`` drops the ``mtp.*`` draft stack (earlier builds did);
+    the default retains it — sanitized and quantized with the rest, written
+    to its own ``model-mtp`` shard, carried as declared passthrough by the
+    loader.
 
     ``config.json`` gets a ``quantization`` block with defaults plus an
     explicit per-module map keyed by runtime-internal module paths.
-    Returns {kept, dropped_mtp, vision_passthrough}.
+    Returns {kept, dropped_mtp, mtp_kept, vision_passthrough}.
     """
     os.makedirs(dst, exist_ok=True)
     wmap = _shard_iter(src)
@@ -311,7 +403,10 @@ def convert(src: str, dst: str, bits: int | None = None,
     groups: dict[str, list[str]] = {}
     for name in wmap:
         groups.setdefault(owner(name), []).append(name)
-    accounting = {"kept": 0, "dropped_mtp": len(groups.pop("mtp", [])),
+    mtp_names = groups.pop("mtp", [])
+    accounting = {"kept": 0,
+                  "dropped_mtp": len(mtp_names) if not keep_mtp else 0,
+                  "mtp_kept": 0,
                   "vision_passthrough": 0}
 
     shard_cache: dict[str, dict] = {}
@@ -328,15 +423,18 @@ def convert(src: str, dst: str, bits: int | None = None,
 
     order = ["top"] + sorted((g for g in groups if g.startswith("layers.")),
                              key=lambda s: int(s.split(".")[1]))
+    if keep_mtp and mtp_names:
+        order.append("mtp")
     if "vision" in groups:
         order.append("vision")
 
     index: dict[str, str] = {}
     module_map: dict[str, dict] = {}
+    t0 = time.time()
 
-    for g in order:
+    for gi, g in enumerate(order, 1):
         tag = _group_tag(g)
-        names = sorted(groups[g])
+        names = sorted(mtp_names if g == "mtp" else groups[g])
         out_files = {"main": os.path.join(dst, f"model-{tag}.safetensors")}
         engram_pair = [n for n in names if ".engram.embed." in n]
         if engram_pair:
@@ -346,7 +444,11 @@ def convert(src: str, dst: str, bits: int | None = None,
         if resume and os.path.exists(manifest_path) and \
                 all(os.path.exists(p) for p in out_files.values()):
             man = json.load(open(manifest_path))
+            cached = True
         else:
+            cached = False
+            print(f"[{gi}/{len(order)}] {g}: {len(names)} tensors — "
+                  f"sanitizing + quantizing...", flush=True)
             work = [n for n in names if n not in engram_pair]
             sane = sanitize_group(work, fetch(work), dtype)
             grp_modules: dict[str, dict] = {}
@@ -359,6 +461,9 @@ def convert(src: str, dst: str, bits: int | None = None,
             os.replace(tmp, out_files["main"])
             engram_names = []
             if engram_pair and engram_bits:
+                print(f"  engram table -> re-quantizing "
+                      f"({fmt_bits(_family(engram_bits, group_size))}) in row chunks...",
+                      flush=True)
                 wname = next(n for n in engram_pair if n.endswith(".weight"))
                 base = wname[: -len(".weight")]
                 triple = quantize_engram_table_from_file(src, wmap, wname,
@@ -371,6 +476,8 @@ def convert(src: str, dst: str, bits: int | None = None,
                 del triple, shard
                 mx.clear_cache()
             elif engram_pair:
+                print("  engram table -> streaming native fp8+ue8m0 passthrough...",
+                      flush=True)
                 _stream_raw_copy(src, wmap, engram_pair, out_files["engram"])
                 engram_names = engram_pair
             man = {"files": {os.path.basename(out_files["main"]): sorted(sane),
@@ -387,7 +494,17 @@ def convert(src: str, dst: str, bits: int | None = None,
             accounting["kept"] += len(tnames)
             if g == "vision":
                 accounting["vision_passthrough"] += len(tnames)
+            elif g == "mtp":
+                accounting["mtp_kept"] += len(tnames)
         module_map.update(man["modules"])
+        size = sum(os.path.getsize(p) for p in out_files.values())
+        print(f"[{gi}/{len(order)}] {g}: {sum(len(v) for v in man['files'].values())} tensors out, "
+              f"{len(man['modules'])} modules quantized, {size / 1e9:.2f} GB"
+              f"{' (cached)' if cached else ''} — {time.time() - t0:.0f}s elapsed", flush=True)
+
+    total_gb = sum(os.path.getsize(os.path.join(dst, f)) for f in set(index.values()))
+    print(f"done: {len(index)} tensors in {len(set(index.values()))} shards, "
+          f"{total_gb / 1e9:.1f} GB — {time.time() - t0:.0f}s total", flush=True)
 
     json.dump({"metadata": {}, "weight_map": index},
               open(os.path.join(dst, "model.safetensors.index.json"), "w"))
@@ -396,11 +513,18 @@ def convert(src: str, dst: str, bits: int | None = None,
     cfg = json.load(open(cfg_path)) if os.path.exists(cfg_path) else {}
     out_cfg = dict(cfg)
     out_cfg["model_type"] = "deepseek_v41"
+    out_cfg.pop("quantization_config", None)   # describes the raw release, not this build
+    if not keep_mtp:
+        out_cfg["num_nextn_predict_layers"] = 0
+        if "text_config" in out_cfg:
+            out_cfg["text_config"]["num_nextn_predict_layers"] = 0
     if bits or engram_bits:
-        out_cfg["quantization"] = {"group_size": group_size, "bits": bits,
-                                   "expert_bits": expert_bits,
-                                   "engram_bits": engram_bits,
-                                   "modules": module_map}
+        q = dict(_family(bits, group_size) or {"group_size": group_size})
+        q["expert_bits"] = _family(expert_bits, group_size)
+        q["engram_bits"] = _family(engram_bits, group_size)
+        q["modules"] = module_map
+        out_cfg["quantization"] = q
+        out_cfg["quantization_config"] = q
     json.dump(out_cfg, open(os.path.join(dst, "config.json"), "w"), indent=2)
 
     for f in ("tokenizer.json", "tokenizer_config.json"):

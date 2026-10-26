@@ -10,9 +10,13 @@ random-initialized (the GLM-5.2 lesson); this loader refuses that:
   never silently ignored);
 * quantization is replayed from ``config.json``: the converter writes an
   explicit per-module map (``quantization`` carries defaults plus
-  ``<module path>: {group_size, bits} | false`` entries keyed by
-  runtime-internal module paths); when the map is absent the loader falls back
+  ``<module path>: {group_size, bits[, mode]} | false`` entries keyed by
+  runtime-internal module paths; ``mode`` selects mxfp4/mxfp8 microscaling —
+  no biases, group size 32); when the map is absent the loader falls back
   to the same ``is_quant_target`` / ``bits_for`` rules the converter used.
+* the MTP draft stack (``mtp.*``), when the build retained it, is declared
+  passthrough like the vision tower: reported, never loaded — the text-only
+  runtime has no DSpark module.
 
 Builds bundle **nothing executable**: no ``model_file`` mechanism exists here —
 a build is loaded through this package (``deepseek_v41_mlx.load.load``), never
@@ -34,11 +38,16 @@ from .convert import VISION_PREFIXES, bits_for, is_quant_target
 from .model import Model
 
 
-def quant_predicate(group_size: int, bits: int, expert_bits: int | None,
+def quant_predicate(group_size: int, bits, expert_bits=None,
                     module_map: dict | None = None):
     """Per-module predicate. With ``module_map`` (the converter's explicit map,
-    keyed by runtime-internal module paths) the map is authoritative; without
-    it, fall back to the converter's rule set."""
+    keyed by runtime-internal module paths) the map is authoritative — entries
+    may carry a microscaling ``mode``; without it, fall back to the converter's
+    rule set. ``bits``/``expert_bits`` take affine widths or complete param
+    dicts, matching both old int-only and current mode-aware config blocks."""
+    expert = expert_bits if isinstance(expert_bits, dict) else \
+        ({"group_size": group_size, "bits": int(expert_bits)} if expert_bits else None)
+
     def pred(path, module):
         if not hasattr(module, "to_quantized"):
             return False
@@ -51,7 +60,8 @@ def quant_predicate(group_size: int, bits: int, expert_bits: int | None,
         name = path + ".weight"
         if not is_quant_target(name, w.shape[-1], group_size):
             return False
-        return {"group_size": group_size, "bits": bits_for(name, bits, expert_bits)}
+        return bits_for(name, {"group_size": group_size, "bits": bits},
+                        expert, group_size)
     return pred
 
 
@@ -131,20 +141,26 @@ def load(path: str, lazy: bool | None = None, strict: bool = True):
                                                         module_map))
         if q.get("engram_bits"):
             from .engram import QuantizedEngramEmbedding
+            eb = q["engram_bits"]
+            if not isinstance(eb, dict):
+                eb = {"group_size": q["group_size"], "bits": int(eb)}
             for layer in model.layers:
                 if layer.engram is not None:
                     e = layer.engram.embed
                     layer.engram.embed = QuantizedEngramEmbedding(
                         e.weight.shape[0], e.weight.shape[1],
-                        q["group_size"], q["engram_bits"])
+                        eb["group_size"], eb["bits"], mode=eb.get("mode", "affine"))
 
-    loaded, vision_skipped = set(), set()
+    loaded, vision_skipped, mtp_skipped = set(), set(), set()
     for shard in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
         w = mx.load(shard)
         items = []
         for k, v in w.items():
             if k.startswith(VISION_PREFIXES):
                 vision_skipped.add(k)      # declared passthrough, text-only runtime
+                continue
+            if k.startswith("mtp."):
+                mtp_skipped.add(k)         # declared passthrough, draft stack
                 continue
             items.append((k, v))
         model.load_weights(items, strict=False)
@@ -164,4 +180,5 @@ def load(path: str, lazy: bool | None = None, strict: bool = True):
                          f"e.g. {sorted(unexpected)[:4]}")
     model.eval()
     model._vision_passthrough = sorted(vision_skipped)
+    model._mtp_passthrough = sorted(mtp_skipped)
     return model, args
