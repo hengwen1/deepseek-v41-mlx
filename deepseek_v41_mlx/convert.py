@@ -451,8 +451,13 @@ def convert(src: str, dst: str, bits: int | dict | None = None,
             res[n] = shard_cache[f][n]
         return res
 
-    order = ["top"] + sorted((g for g in groups if g.startswith("layers.")),
-                             key=lambda s: int(s.split(".")[1]))
+    if not wmap:
+        raise FileNotFoundError(
+            f"no safetensors found under {src!r} — check the snapshot path "
+            f"(model.safetensors.index.json or *.safetensors expected)")
+    order = (["top"] if "top" in groups else []) + \
+        sorted((g for g in groups if g.startswith("layers.")),
+               key=lambda s: int(s.split(".")[1]))
     if keep_mtp and mtp_names:
         order.append("mtp")
     if "vision" in groups:
